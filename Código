@@ -1,0 +1,1566 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <time.h>
+#include <math.h>
+
+// ============================================================
+// 1. CONFIGURACION DE RED Y HORA
+// ============================================================
+
+const char* WIFI_SSID = "Aplicacion";
+const char* WIFI_PASSWORD = "Agnatha73.";
+
+const char* AP_SSID = "Seguidor_Solar";
+const char* AP_PASSWORD = "Solar2026";
+
+constexpr long GMT_OFFSET_SECONDS = -5L * 3600L;
+constexpr int DAYLIGHT_OFFSET_SECONDS = 0;
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.nist.gov";
+
+constexpr uint32_t INTERNET_STARTUP_TIMEOUT_MS = 30000UL;
+constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 8000UL;
+
+// ============================================================
+// 2. CONFIGURACION DEL RTC DS3231 Y MPU6050 (DOS BUSES I2C)
+// ============================================================
+
+// Bus I2C 0: RTC DS3231
+constexpr uint8_t RTC_SDA_PIN = 21;
+constexpr uint8_t RTC_SCL_PIN = 22;
+
+// Bus I2C 1: MPU6050
+constexpr uint8_t MPU_SDA_PIN = 32;
+constexpr uint8_t MPU_SCL_PIN = 33;
+
+RTC_DS3231 rtc;
+TwoWire mpuWire = TwoWire(1);
+
+constexpr uint8_t DS3231_ADDR = 0x68;
+constexpr uint8_t MPU6050_ADDR = 0x68; // Dirección por defecto del MPU6050
+
+constexpr uint32_t I2C_RETRY_INTERVAL_MS = 500UL; // Comprobación frecuente para activar el bloqueo rápido
+
+// Filtro del MPU6050: pasa-bajos exponencial con manejo del salto +180/-180°.
+// Un alpha menor filtra más ruido; uno mayor responde más rápido.
+constexpr float MPU_FILTER_ALPHA = 0.15f;
+constexpr float MPU_MAX_SINGLE_SAMPLE_JUMP_DEG = 12.0f;
+
+// ============================================================
+// 3. CONFIGURACION DEL MOTOR Y DRIVER (TB6600)
+// ============================================================
+
+constexpr uint8_t STEP_PIN_1 = 26;
+constexpr uint8_t DIR_PIN_1 = 27;
+constexpr uint8_t ENA_PIN_1 = 25;
+
+constexpr uint8_t MOTOR_ENABLE_LEVEL = LOW; 
+constexpr uint8_t MOTOR_DISABLE_LEVEL = HIGH;
+
+constexpr uint8_t STEP_ACTIVE_LEVEL = HIGH;
+constexpr uint8_t STEP_IDLE_LEVEL = LOW;
+constexpr uint8_t DIR_LEVEL_TO_POSITIVE = LOW; // Invertido a LOW para corregir el giro físico del motor
+
+constexpr uint16_t FIXED_STEP_RATE_PPS = 200;
+constexpr float ACCELERATION_PPS2 = 2000.0f;
+constexpr float START_STEP_RATE_PPS = 20.0f;
+constexpr uint16_t STEP_PULSE_WIDTH_US = 10;
+constexpr uint16_t DIR_SETUP_TIME_US = 5;
+
+// Relación angular conservada (utilizada ahora para mantener 
+// compatible la lógica de la rampa de aceleración/frenado)
+constexpr float MOTOR_DEGREES_PER_FULL_STEP = 1.8f;
+constexpr float PANEL_DEGREES_PER_MOTOR_DEGREE = 0.04495575221f;
+constexpr uint16_t MOTOR_FULL_STEPS_PER_REVOLUTION = 200;
+constexpr uint16_t MICROSTEP_DIVISOR = 8; 
+constexpr uint32_t DRIVER_PULSES_PER_MOTOR_REVOLUTION = MOTOR_FULL_STEPS_PER_REVOLUTION * MICROSTEP_DIVISOR;
+
+constexpr float MOTOR_DEGREES_PER_PULSE = MOTOR_DEGREES_PER_FULL_STEP / MICROSTEP_DIVISOR;
+constexpr float PANEL_DEGREES_PER_PULSE = MOTOR_DEGREES_PER_PULSE * PANEL_DEGREES_PER_MOTOR_DEGREE;
+
+constexpr float PANEL_MIN_ANGLE = -30.0f;
+constexpr float PANEL_MAX_ANGLE = 30.0f;
+constexpr float PANEL_TOTAL_RANGE = PANEL_MAX_ANGLE - PANEL_MIN_ANGLE;
+
+constexpr int START_MINUTE_OF_DAY = 6 * 60;
+constexpr int END_MINUTE_OF_DAY = 18 * 60;
+constexpr int TRACKING_DURATION_MINUTES = END_MINUTE_OF_DAY - START_MINUTE_OF_DAY;
+
+// Tolerancias para el control en lazo cerrado con MPU6050
+constexpr float ANGLE_TOLERANCE_STOP = 0.25f;  // Detenerse si el error es menor a este ángulo
+constexpr float ANGLE_TOLERANCE_START = 0.70f; // Arrancar de nuevo solo si el error supera este umbral (Histéresis)
+
+// ============================================================
+// 4. OBJETOS Y ESTADO DEL SISTEMA
+// ============================================================
+
+WebServer server(80);
+Preferences preferences;
+
+enum class SystemState {
+  WAITING_FOR_MPU,
+  WAITING_FOR_RTC,
+  SAFETY_LOCK,
+  MOVING,
+  RESTING
+};
+
+SystemState systemState = SystemState::WAITING_FOR_MPU;
+
+bool movementPaused = false;
+bool isTargetReached = true;
+
+// Variables angulares
+float currentPanelAngle = 0.0f;
+float targetPanelAngle = 0.0f;
+
+// Variables de hardware
+bool mpuDetected = false;
+bool rtcDetected = false;
+bool rtcTimeIsValid = false;
+bool mpuFilterInitialized = false;
+bool rtcWasSynchronizedByNtp = false;
+
+// Variables para la prueba post-6 PM
+bool isPost6pmTestActive = false;
+uint32_t post6pmTestStartMillis = 0;
+
+bool ntpWasStarted = false;
+bool startupInternetFinished = false;
+bool stationInterfaceEnabled = true;
+
+uint16_t discretizationMinutes = 60;
+float instantaneousCommandRatePps = 0.0f;
+float scheduledTheoreticalAngle = PANEL_MIN_ANGLE;
+int8_t activeMotorDirection = 0;
+uint32_t lastRampUpdateMicros = 0;
+
+uint32_t pulseCounterWindow = 0;
+uint64_t totalGeneratedPulses = 0;
+uint64_t totalPulsesToday = 0;
+int lastRecordedDay = -1;
+
+uint32_t speedWindowStartMicros = 0;
+float measuredStepRatePps = 0.0f;
+
+uint32_t nextPulseMicros = 0;
+uint32_t lastScheduleUpdateMillis = 0;
+uint32_t lastMpuReadMillis = 0;
+uint32_t lastI2CRetryMillis = 0;
+uint32_t wifiStartupMillis = 0;
+uint32_t lastWifiRetryMillis = 0;
+
+// ============================================================
+// 5. PAGINA WEB CON SOPORTE PARA 1 MOTOR, MPU6050 Y PRUEBA 6PM
+// ============================================================
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Seguidor solar - Monitoreo y Control (IMU Integrado)</title>
+  <style>
+    :root {
+      font-family: Arial, Helvetica, sans-serif;
+      color-scheme: dark;
+      --card: #18202b;
+      --border: #334155;
+      --text-soft: #aebbd0;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #0b111a;
+      color: #f8fafc;
+      display: flex;
+      justify-content: center;
+      padding: 22px;
+    }
+
+    main { width: min(960px, 100%); }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: clamp(1.7rem, 5vw, 2.6rem);
+    }
+
+    .subtitle {
+      color: var(--text-soft);
+      margin-bottom: 20px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 10px 26px rgba(0, 0, 0, .22);
+    }
+
+    .wide { grid-column: 1 / -1; }
+
+    .label {
+      color: var(--text-soft);
+      font-size: .9rem;
+      margin-bottom: 8px;
+    }
+
+    .value {
+      font-size: 1.55rem;
+      font-weight: 700;
+    }
+
+    .small-value {
+      font-size: 1.05rem;
+      font-weight: 600;
+      overflow-wrap: anywhere;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: #263244;
+      font-weight: 700;
+    }
+
+    .dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: #94a3b8;
+    }
+
+    .moving .dot {
+      background: #f59e0b;
+      box-shadow: 0 0 12px #f59e0b;
+    }
+
+    .resting .dot {
+      background: #22c55e;
+      box-shadow: 0 0 12px #22c55e;
+    }
+
+    .error .dot {
+      background: #ef4444;
+      box-shadow: 0 0 12px #ef4444;
+    }
+
+    .waiting .dot {
+      background: #38bdf8;
+      box-shadow: 0 0 12px #38bdf8;
+    }
+
+    .badge-active {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: bold;
+      background: #15803d;
+      color: #fff;
+    }
+
+    .badge-inactive {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: bold;
+      background: #b91c1c;
+      color: #fff;
+    }
+
+    .motors-container { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 10px; justify-content: center; }
+    .motor-box {
+      flex: 1; max-width: 400px; min-width: 200px; background: #0f172a; border: 1px solid #334155; 
+      border-radius: 12px; padding: 16px; display: flex; flex-direction: column; 
+      align-items: center; gap: 12px;
+    }
+    .motor-title { color: #f8fafc; font-weight: 800; font-size: 1.1rem; }
+    .motor-icon { width: 65px; height: 65px; color: #475569; transition: color 0.3s; }
+    .motor-info { display: flex; flex-direction: column; align-items: center; gap: 5px; }
+    .motor-status-text { font-weight: bold; font-size: 1.15rem; }
+    .motor-speed-text { color: #38bdf8; font-family: monospace; font-size: 1.1rem; background: #1e293b; padding: 4px 8px; border-radius: 6px;}
+
+    @keyframes spin-cw { 100% { transform: rotate(360deg); } }
+    @keyframes spin-ccw { 100% { transform: rotate(-360deg); } }
+
+    .spin-cw { animation: spin-cw linear infinite; color: #22c55e; }
+    .spin-ccw { animation: spin-ccw linear infinite; color: #f59e0b; }
+
+    .gauge {
+      position: relative;
+      height: 340px;
+      margin-top: 8px;
+      overflow: hidden;
+      border-radius: 14px;
+      background:
+        radial-gradient(circle at 50% 50%, rgba(255,255,255,.08), transparent 28%),
+        linear-gradient(180deg, #101925, #0d1420);
+      border: 1px solid var(--border);
+    }
+
+    .horizon {
+      position: absolute;
+      left: 6%;
+      right: 6%;
+      top: 50%;
+      height: 2px;
+      background: #64748b;
+    }
+
+    .horizon-text {
+      position: absolute;
+      left: 7%;
+      top: calc(50% - 25px);
+      color: var(--text-soft);
+      font-size: .82rem;
+    }
+
+    .range-arc {
+      position: absolute;
+      left: 50%;
+      top: 13%;
+      width: 39%;
+      height: 74%;
+      border: 2px solid #475569;
+      border-left: none;
+      border-radius: 0 100% 100% 0;
+    }
+
+    .needle {
+      position: absolute;
+      left: 11%;
+      top: 50%;
+      width: 78%;
+      height: 0;
+      transform-origin: center;
+      transition: transform .35s linear;
+    }
+
+    .current-needle {
+      border-top: 13px solid #f8fafc;
+      border-radius: 10px;
+      margin-top: -6px;
+      z-index: 3;
+    }
+
+    .target-needle {
+      border-top: 4px dashed #f59e0b;
+      margin-top: -2px;
+      z-index: 2;
+    }
+
+    .hub {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #38bdf8;
+      transform: translate(-50%, -50%);
+      z-index: 4;
+      border: 4px solid #e2e8f0;
+    }
+
+    .angle-label {
+      position: absolute;
+      color: var(--text-soft);
+      font-size: .9rem;
+      font-weight: 700;
+    }
+
+    .plus { right: 12%; top: 7%; }
+    .zero { right: 4%; top: 50%; transform: translateY(-50%); }
+    .minus { right: 12%; bottom: 7%; }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      color: var(--text-soft);
+      margin-top: 12px;
+      font-size: .92rem;
+    }
+
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 24px;
+      margin-right: 7px;
+      vertical-align: middle;
+    }
+
+    .legend-current::before { border-top: 7px solid #f8fafc; }
+    .legend-target::before { border-top: 3px dashed #f59e0b; }
+
+    form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .field { flex: 1 1 210px; }
+
+    input {
+      width: 100%;
+      margin-top: 7px;
+      padding: 12px;
+      border-radius: 10px;
+      border: 1px solid #64748b;
+      background: #0f172a;
+      color: white;
+      font-size: 1rem;
+    }
+
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 13px 18px;
+      background: #38bdf8;
+      color: #07111c;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    button:hover { filter: brightness(1.08); }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: .55;
+      filter: none;
+    }
+
+    .zero-panel {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .zero-instructions {
+      flex: 1 1 430px;
+      color: var(--text-soft);
+      line-height: 1.5;
+    }
+
+    .stop-button {
+      background: #ef4444;
+      color: #ffffff;
+      min-width: 180px;
+    }
+
+    .continue-button {
+      background: #22c55e;
+      color: #ffffff;
+      min-width: 180px;
+    }
+
+    #message, #stopMessage, #testMessage {
+      min-height: 1.2em;
+      color: #7dd3fc;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Seguidor solar (Sistema de 1 Motor + MPU6050)</h1>
+  <div class="subtitle">
+    Control de seguimiento automatizado con lectura absoluta de acelerómetro en tiempo real.
+  </div>
+
+  <section class="grid">
+    <!-- Estado -->
+    <article class="card">
+      <div class="label">Estado del Sistema</div>
+      <div id="statusPill" class="status waiting">
+        <span class="dot"></span>
+        <span id="state">Cargando...</span>
+      </div>
+    </article>
+
+    <!-- Estado IMU -->
+    <article class="card">
+      <div class="label">Estado MPU6050 (0x68, SDA 32 / SCL 33)</div>
+      <div id="mpuStatus" class="small-value">--</div>
+    </article>
+
+    <!-- Estado del RTC -->
+    <article class="card">
+      <div class="label">Estado RTC DS3231 (0x68, SDA 21 / SCL 22)</div>
+      <div id="rtcStatus" class="small-value">--</div>
+    </article>
+
+    <!-- Hora del RTC -->
+    <article class="card">
+      <div class="label">Hora captada por el RTC</div>
+      <div id="clock" class="small-value">--</div>
+    </article>
+
+    <!-- Posición actual -->
+    <article class="card">
+      <div class="label">Posición actual (Sensor)</div>
+      <div id="currentAngle" class="value">--</div>
+    </article>
+
+    <!-- Posición deseada -->
+    <article class="card">
+      <div class="label">Posición deseada</div>
+      <div id="targetAngle" class="value">--</div>
+    </article>
+
+    <!-- Vueltas del Motor Acumuladas -->
+    <article class="card">
+      <div class="label">Vueltas Acumuladas</div>
+      <div id="motor1Turns" class="value">0.00</div>
+    </article>
+
+    <!-- Discretización -->
+    <article class="card">
+      <div class="label">Discretización del tiempo</div>
+      <div id="intervalValue" class="value">--</div>
+    </article>
+
+    <!-- Avance por Discretización -->
+    <article class="card" style="background: #0f172a;">
+      <div class="label">Avance del Panel por Intervalo</div>
+      <div id="stepDegreeValue" class="value">--</div>
+    </article>
+
+    <!-- Cinemática del Motor -->
+    <article class="card wide">
+      <div class="label">Cinemática y Estado Físico del Motor</div>
+      <div class="motors-container">
+        
+        <div class="motor-box" id="motor1Box">
+          <div class="motor-title">Motor (Avance y Retorno)</div>
+          <svg class="motor-icon" id="motor1Icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"></path>
+            <path d="M21 3v5h-5"></path>
+          </svg>
+          <div class="motor-info">
+            <span class="motor-status-text" id="m1DynStatus">Detenido</span>
+            <span class="motor-speed-text" id="m1DynSpeed">0.00 &deg;/s</span>
+          </div>
+          <div id="motor1Status" class="badge-inactive" style="margin-top: 5px;">Desactivado</div>
+        </div>
+
+      </div>
+    </article>
+
+    <!-- Panel de Prueba Post-6PM -->
+    <article class="card wide" id="testBannerCard" style="display: none; background: #1e293b; border-color: #f59e0b;">
+      <div class="label" style="color: #f59e0b; font-weight: bold;">Prueba de Funcionamiento Post-6 PM</div>
+      <div id="testBannerText" class="small-value" style="color: #fef08a;">--</div>
+    </article>
+
+    <!-- Panel de Control y Configuración -->
+    <article class="card wide">
+      <div class="zero-panel">
+        <div class="zero-instructions">
+          <strong>Control de Paro / Pausa</strong><br>
+          Detiene o reanuda el movimiento activo del seguidor.
+        </div>
+        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+          <button id="stopButton" class="stop-button" type="button">
+            Detener Movimiento
+          </button>
+          <button id="continueButton" class="continue-button" type="button">
+            Continuar Movimiento
+          </button>
+        </div>
+      </div>
+      <div id="stopMessage"></div>
+    </article>
+
+    <article class="card wide">
+      <div class="label">Ángulo del extremo accionado respecto de la horizontal (IMU)</div>
+      <div class="gauge">
+        <div class="range-arc"></div>
+        <div class="horizon"></div>
+        <div class="horizon-text">Horizontal</div>
+        <div id="targetNeedle" class="needle target-needle"></div>
+        <div id="currentNeedle" class="needle current-needle"></div>
+        <div class="hub"></div>
+        <span class="angle-label plus">+30°</span>
+        <span class="angle-label zero">0°</span>
+        <span class="angle-label minus">−30°</span>
+      </div>
+      <div class="legend">
+        <span class="legend-current">Posición actual</span>
+        <span class="legend-target">Posición deseada</span>
+      </div>
+    </article>
+
+    <article class="card wide">
+      <form id="intervalForm">
+        <div class="field">
+          <label for="minutes">Actualizar Discretización (minutos)</label>
+          <input id="minutes" name="minutes" type="number"
+                 min="1" max="720" step="1" required>
+        </div>
+        <button type="submit">Aplicar, Recalcular y Posicionar</button>
+      </form>
+      <div id="message"></div>
+    </article>
+  </section>
+</main>
+
+<script>
+  const currentNeedle = document.getElementById("currentNeedle");
+  const targetNeedle = document.getElementById("targetNeedle");
+  const statusPill = document.getElementById("statusPill");
+  const message = document.getElementById("message");
+  const stopMessage = document.getElementById("stopMessage");
+  const stopButton = document.getElementById("stopButton");
+  const continueButton = document.getElementById("continueButton");
+  const testBannerCard = document.getElementById("testBannerCard");
+  const testBannerText = document.getElementById("testBannerText");
+
+  function stateClass(stateCode) {
+    if (stateCode === "MOVING") return "moving";
+    if (stateCode === "RESTING") return "resting";
+    if (stateCode === "SAFETY_LOCK") return "error";
+    return "waiting";
+  }
+
+  function physicalToCssAngle(physicalAngle) {
+    return -Number(physicalAngle);
+  }
+
+  async function refreshStatus() {
+    try {
+      const response = await fetch("/status", { cache: "no-store" });
+      const data = await response.json();
+
+      document.getElementById("state").textContent = data.stateText;
+      statusPill.className = "status " + stateClass(data.stateCode);
+
+      const rtcStat = document.getElementById("rtcStatus");
+      if (!data.rtcDetected) {
+        rtcStat.textContent = "Desconectado / Error I2C";
+        rtcStat.style.color = "#ef4444";
+        document.getElementById("clock").textContent = "RTC no detectado";
+      } else if (!data.timeValid) {
+        rtcStat.textContent = "Conectado, hora no válida";
+        rtcStat.style.color = "#f59e0b";
+        document.getElementById("clock").textContent = "RTC detectado, pero requiere sincronización";
+      } else {
+        rtcStat.textContent = "Conectado y funcionando";
+        rtcStat.style.color = "#22c55e";
+        document.getElementById("clock").textContent = data.time;
+      }
+
+      const mpuStat = document.getElementById("mpuStatus");
+      mpuStat.textContent = data.mpuDetected ? "Conectado y Leyendo" : "Desconectado / Error";
+      mpuStat.style.color = data.mpuDetected ? "#22c55e" : "#ef4444";
+
+      document.getElementById("motor1Turns").textContent = Number(data.motor1Turns).toFixed(2);
+      document.getElementById("stepDegreeValue").textContent = Number(data.anglePerInterval).toFixed(3) + "° / " + data.intervalMinutes + " min";
+
+      const m1StatusBadge = document.getElementById("motor1Status");
+      if (data.safetyLock) {
+        m1StatusBadge.textContent = "BLOQUEADO CON TORQUE";
+        m1StatusBadge.className = "badge-active";
+      } else {
+        m1StatusBadge.textContent = data.motor1Active ? "Activado (Frenado/Torque)" : "Desactivado";
+        m1StatusBadge.className = data.motor1Active ? "badge-active" : "badge-inactive";
+      }
+
+      const isMoving = data.stateCode === "MOVING";
+      const dir = data.motorDirection; 
+      const speedDeg = data.motorSpeedDeg; 
+
+      const m1Icon = document.getElementById("motor1Icon");
+      const m1Status = document.getElementById("m1DynStatus");
+      const m1Speed = document.getElementById("m1DynSpeed");
+
+      m1Icon.setAttribute("class", "motor-icon"); 
+      m1Status.textContent = "Detenido"; m1Status.style.color = "#64748b"; 
+      m1Speed.textContent = "0.00 °/s"; m1Speed.style.color = "#64748b";
+
+      if (isMoving && dir > 0) {
+        m1Icon.setAttribute("class", "motor-icon spin-cw");
+        m1Icon.style.animationDuration = Math.max(0.15, 60 / (data.motorSpeedPPS + 1)) + "s";
+        m1Status.textContent = "Avanzando \u2192";
+        m1Status.style.color = "#22c55e";
+        m1Speed.textContent = Number(speedDeg).toFixed(2) + " °/s";
+        m1Speed.style.color = "#22c55e";
+      } 
+      else if (isMoving && dir < 0) {
+        m1Icon.setAttribute("class", "motor-icon spin-ccw");
+        m1Icon.style.animationDuration = Math.max(0.15, 60 / (data.motorSpeedPPS + 1)) + "s";
+        m1Status.textContent = "\u2190 Retornando";
+        m1Status.style.color = "#f59e0b";
+        m1Speed.textContent = Number(speedDeg).toFixed(2) + " °/s";
+        m1Speed.style.color = "#f59e0b";
+      }
+
+      if (data.isPost6pmTest) {
+        testBannerCard.style.display = "block";
+        testBannerText.textContent = data.testMessage;
+      } else {
+        testBannerCard.style.display = "none";
+      }
+
+      if (data.mpuDetected) {
+        document.getElementById("currentAngle").textContent = Number(data.currentAngle).toFixed(2) + "°";
+        currentNeedle.style.transform = "rotate(" + physicalToCssAngle(data.currentAngle) + "deg)";
+        currentNeedle.style.opacity = "1";
+      } else {
+        document.getElementById("currentAngle").textContent = "Desconocida";
+        currentNeedle.style.opacity = ".25";
+      }
+
+      document.getElementById("targetAngle").textContent = Number(data.targetAngle).toFixed(2) + "°";
+      targetNeedle.style.transform = "rotate(" + physicalToCssAngle(data.targetAngle) + "deg)";
+
+      document.getElementById("intervalValue").textContent = data.intervalMinutes + " min";
+
+      if (document.activeElement !== document.getElementById("minutes")) {
+        document.getElementById("minutes").value = data.intervalMinutes;
+      }
+
+      stopButton.disabled = data.movementPaused;
+      continueButton.disabled = !data.movementPaused;
+    } catch (error) {
+      document.getElementById("state").textContent = "Sin respuesta de la ESP32";
+      statusPill.className = "status error";
+    }
+  }
+
+  stopButton.addEventListener("click", async () => {
+    stopMessage.textContent = "Pausando movimiento...";
+    try {
+      const response = await fetch("/stopMovement", { method: "POST" });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.message || "Error al detener.");
+      stopMessage.textContent = result.message;
+      refreshStatus();
+    } catch (error) {
+      stopMessage.textContent = error.message;
+    }
+  });
+
+  continueButton.addEventListener("click", async () => {
+    stopMessage.textContent = "Reanudando movimiento...";
+    try {
+      const response = await fetch("/continueMovement", { method: "POST" });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.message || "Error al reanudar.");
+      stopMessage.textContent = result.message;
+      refreshStatus();
+    } catch (error) {
+      stopMessage.textContent = error.message;
+    }
+  });
+
+  document.getElementById("intervalForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const minutes = document.getElementById("minutes").value;
+    message.textContent = "Aplicando discretización y reposicionando...";
+    try {
+      const response = await fetch("/setInterval?minutes=" + encodeURIComponent(minutes), { method: "POST" });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.message || "Error al aplicar valor.");
+      message.textContent = "Discretización actualizada y objetivo recalculado.";
+      refreshStatus();
+    } catch (error) {
+      message.textContent = error.message;
+    }
+  });
+
+  refreshStatus();
+  setInterval(refreshStatus, 400);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================
+// 6. DIAGNOSTICO I2C Y FUNCIONES DEL MPU6050
+// ============================================================
+
+bool i2cAddressResponds(TwoWire& bus, uint8_t address) {
+  bus.beginTransmission(address);
+  return bus.endTransmission() == 0;
+}
+
+void scanI2CBus(TwoWire& bus, const char* busName) {
+  Serial.print("\n--- ESCANEO ");
+  Serial.print(busName);
+  Serial.println(" ---");
+
+  uint8_t found = 0;
+
+  for (uint8_t address = 1; address < 127; ++address) {
+    bus.beginTransmission(address);
+    const uint8_t error = bus.endTransmission();
+
+    if (error == 0) {
+      Serial.print("Dispositivo encontrado en 0x");
+      if (address < 16) Serial.print('0');
+      Serial.println(address, HEX);
+      ++found;
+    }
+  }
+
+  if (found == 0) {
+    Serial.println("NINGUN dispositivo I2C encontrado en este bus.");
+  }
+
+  Serial.println("-------------------\n");
+}
+
+float normalizeAngle180(float angle) {
+  while (angle > 180.0f) angle -= 360.0f;
+  while (angle <= -180.0f) angle += 360.0f;
+  return angle;
+}
+
+float shortestAngularDifference(float target, float current) {
+  return normalizeAngle180(target - current);
+}
+
+void initializeMPU() {
+  // Primero comprobamos que realmente exista un dispositivo en 0x68.
+  if (!i2cAddressResponds(mpuWire, MPU6050_ADDR)) {
+    if (mpuDetected) {
+      Serial.println("MPU6050 perdido: 0x68 dejo de responder. BLOQUEO DE SEGURIDAD.");
+    }
+    mpuDetected = false;
+    mpuFilterInitialized = false;
+    return;
+  }
+
+  // Despertar MPU6050 escribiendo 0 en PWR_MGMT_1.
+  mpuWire.beginTransmission(MPU6050_ADDR);
+  mpuWire.write(0x6B);
+  mpuWire.write(0x00);
+  const uint8_t result = mpuWire.endTransmission();
+
+  const bool wasDetected = mpuDetected;
+  mpuDetected = (result == 0);
+
+  if (mpuDetected && !wasDetected) {
+    mpuFilterInitialized = false;
+    Serial.println("MPU6050 detectado y despertado correctamente en 0x68.");
+  } else if (!mpuDetected) {
+    mpuFilterInitialized = false;
+    Serial.println("Error al inicializar MPU6050 en 0x68.");
+  }
+}
+
+bool readMPUAngle() {
+  if (!mpuDetected) return false;
+
+  mpuWire.beginTransmission(MPU6050_ADDR);
+  mpuWire.write(0x3B); // ACCEL_XOUT_H
+
+  if (mpuWire.endTransmission(false) != 0) {
+    Serial.println("Error de lectura MPU6050. BLOQUEO DE SEGURIDAD y reintento automatico.");
+    mpuDetected = false;
+    mpuFilterInitialized = false;
+    return false;
+  }
+
+  const uint8_t received = mpuWire.requestFrom(MPU6050_ADDR, (uint8_t)6, (uint8_t)true);
+  if (received != 6 || mpuWire.available() < 6) {
+    Serial.println("MPU6050 devolvio menos de 6 bytes. BLOQUEO DE SEGURIDAD.");
+    mpuDetected = false;
+    mpuFilterInitialized = false;
+    return false;
+  }
+
+  const int16_t ax = (mpuWire.read() << 8) | mpuWire.read();
+  const int16_t ay = (mpuWire.read() << 8) | mpuWire.read();
+  const int16_t az = (mpuWire.read() << 8) | mpuWire.read();
+  (void)ax;
+
+  /*
+   * Angulo de rotacion sobre el eje X.
+   * El signo de Z se invierte por la orientacion fisica del sensor.
+   */
+  const float rawAngle = normalizeAngle180(
+      atan2f((float)ay, -(float)az) * 180.0f / PI);
+
+  // Primera lectura: se toma directamente para evitar que el filtro arranque desde 0°.
+  if (!mpuFilterInitialized) {
+    currentPanelAngle = rawAngle;
+    mpuFilterInitialized = true;
+    return true;
+  }
+
+  // Diferencia angular corta: evita el salto visual/control de ~360° al cruzar +180/-180°.
+  const float angularDifference = shortestAngularDifference(rawAngle, currentPanelAngle);
+
+  // Rechazo de un pico aislado imposible para la velocidad mecánica de este seguidor.
+  // No se declara el MPU desconectado por una sola muestra ruidosa; simplemente se ignora.
+  if (fabsf(angularDifference) > MPU_MAX_SINGLE_SAMPLE_JUMP_DEG) {
+    return true;
+  }
+
+  // Filtro pasa-bajos exponencial (EMA).
+  currentPanelAngle = normalizeAngle180(
+      currentPanelAngle + MPU_FILTER_ALPHA * angularDifference);
+
+  return true;
+}
+
+float clampPanelAngle(float angle) {
+  if (angle < PANEL_MIN_ANGLE) return PANEL_MIN_ANGLE;
+  if (angle > PANEL_MAX_ANGLE) return PANEL_MAX_ANGLE;
+  return angle;
+}
+
+// ============================================================
+// 7. RTC Y CALCULO HORARIO DISCRETIZADO
+// ============================================================
+
+bool isDateTimePlausible(const DateTime& value) {
+  return value.year() >= 2024 && value.year() <= 2099;
+}
+
+bool readRtcClock(DateTime& currentTime) {
+  if (!rtcDetected) return false;
+
+  // lostPower() indica que el RTC existe, pero su hora no es confiable.
+  if (rtc.lostPower()) return false;
+
+  currentTime = rtc.now();
+  return isDateTimePlausible(currentTime);
+}
+
+void checkAndResetDailyPulses(const DateTime& currentTime) {
+  if (currentTime.day() != lastRecordedDay) {
+    lastRecordedDay = currentTime.day();
+    totalPulsesToday = 0;
+  }
+}
+
+float calculateScheduledAngle(const DateTime& currentTime) {
+  const int currentMinuteOfDay = currentTime.hour() * 60 + currentTime.minute();
+
+  if (currentMinuteOfDay <= START_MINUTE_OF_DAY) {
+    return PANEL_MIN_ANGLE;
+  }
+  // Pasadas las 6 PM (18:00), el panel se regresa a -30°
+  if (currentMinuteOfDay >= END_MINUTE_OF_DAY) {
+    return PANEL_MIN_ANGLE;
+  }
+
+  const int elapsedMinutes = currentMinuteOfDay - START_MINUTE_OF_DAY;
+  const int completedDiscreteMinutes = (elapsedMinutes / discretizationMinutes) * discretizationMinutes;
+
+  const float angle = PANEL_MIN_ANGLE + PANEL_TOTAL_RANGE *
+      (static_cast<float>(completedDiscreteMinutes) / TRACKING_DURATION_MINUTES);
+
+  return clampPanelAngle(angle);
+}
+
+void checkPost6pmTest() {
+  if (!isPost6pmTestActive) return;
+  
+  if (millis() - post6pmTestStartMillis < 60000UL) {
+    targetPanelAngle = PANEL_MAX_ANGLE; // +30° durante el primer minuto
+  } else {
+    targetPanelAngle = PANEL_MIN_ANGLE; // Retorna a -30°
+    if (abs(currentPanelAngle - targetPanelAngle) <= ANGLE_TOLERANCE_STOP) {
+      isPost6pmTestActive = false;
+      Serial.println("Prueba Post-6PM finalizada. Sistema posicionado en -30°.");
+    }
+  }
+}
+
+void updateTargetFromRtc() {
+  DateTime currentTime;
+  rtcTimeIsValid = readRtcClock(currentTime);
+
+  if (!mpuDetected || !rtcDetected || !rtcTimeIsValid) {
+    // Cualquier pérdida de referencia angular o temporal inmoviliza el sistema.
+    systemState = SystemState::SAFETY_LOCK;
+    isTargetReached = true;
+    return;
+  }
+
+  checkAndResetDailyPulses(currentTime);
+
+  // Candado fuerte para pausa
+  if (!movementPaused) {
+    if (currentTime.hour() * 60 + currentTime.minute() >= END_MINUTE_OF_DAY && systemState == SystemState::WAITING_FOR_MPU) {
+      // Activar prueba 6pm si arranca por primera vez en la noche
+      isPost6pmTestActive = true;
+      post6pmTestStartMillis = millis();
+    }
+
+    if (isPost6pmTestActive) {
+      checkPost6pmTest();
+    } else {
+      scheduledTheoreticalAngle = calculateScheduledAngle(currentTime);
+      targetPanelAngle = scheduledTheoreticalAngle;
+    }
+  }
+
+  float error = abs(targetPanelAngle - currentPanelAngle);
+
+  // Lógica de Histéresis: 
+  // Arranca solo si supera el umbral alto, se detiene al cruzar el umbral bajo.
+  if (isTargetReached && error > ANGLE_TOLERANCE_START) {
+    isTargetReached = false;
+  }
+  
+  if (!isTargetReached && error <= ANGLE_TOLERANCE_STOP) {
+    isTargetReached = true;
+  }
+
+  systemState = isTargetReached ? SystemState::RESTING : SystemState::MOVING;
+}
+
+String formattedRtcTime() {
+  DateTime currentTime;
+  if (!readRtcClock(currentTime)) {
+    return "--";
+  }
+  char buffer[30];
+  snprintf(buffer, sizeof(buffer), "%02u/%02u/%04u %02u:%02u:%02u",
+      currentTime.day(), currentTime.month(), currentTime.year(),
+      currentTime.hour(), currentTime.minute(), currentTime.second());
+  return String(buffer);
+}
+
+// ============================================================
+// 8. CONTROL DEL MOTOR, TORQUE Y LAZO CERRADO IMU
+// ============================================================
+
+bool isMotor1Enabled() {
+  return digitalRead(ENA_PIN_1) == MOTOR_ENABLE_LEVEL;
+}
+
+void enableMotor1() {
+  digitalWrite(ENA_PIN_1, MOTOR_ENABLE_LEVEL);
+}
+
+void disableMotor1() {
+  digitalWrite(ENA_PIN_1, MOTOR_DISABLE_LEVEL);
+}
+
+void setMotorDirection(int8_t direction) {
+  uint8_t level = (direction > 0) ? DIR_LEVEL_TO_POSITIVE : (DIR_LEVEL_TO_POSITIVE == HIGH ? LOW : HIGH);
+  digitalWrite(DIR_PIN_1, level);
+}
+
+void generateOnePulse() {
+  digitalWrite(STEP_PIN_1, STEP_ACTIVE_LEVEL);
+  delayMicroseconds(STEP_PULSE_WIDTH_US);
+  digitalWrite(STEP_PIN_1, STEP_IDLE_LEVEL);
+}
+
+uint32_t stepIntervalUsForRate(float ratePps) {
+  if (ratePps < 1.0f) ratePps = 1.0f;
+  return static_cast<uint32_t>(1000000.0f / ratePps);
+}
+
+uint32_t currentStepIntervalUs() {
+  const float safeRate = (instantaneousCommandRatePps > 0.0f)
+          ? instantaneousCommandRatePps
+          : START_STEP_RATE_PPS;
+  return stepIntervalUsForRate(safeRate);
+}
+
+void registerGeneratedPulse() {
+  pulseCounterWindow++;
+  totalGeneratedPulses++;
+  totalPulsesToday++;
+}
+
+void updateMeasuredPulseSpeed() {
+  const uint32_t nowMicros = micros();
+  const uint32_t elapsedMicros = nowMicros - speedWindowStartMicros;
+
+  if (elapsedMicros < 500000UL) return;
+
+  measuredStepRatePps = pulseCounterWindow * (1000000.0f / static_cast<float>(elapsedMicros));
+  pulseCounterWindow = 0;
+  speedWindowStartMicros = nowMicros;
+}
+
+void resetMotionRamp() {
+  instantaneousCommandRatePps = 0.0f;
+  activeMotorDirection = 0;
+  lastRampUpdateMicros = micros();
+  nextPulseMicros = micros();
+}
+
+void updateMotionRamp() {
+  const uint32_t nowMicros = micros();
+  const uint32_t elapsedMicros = nowMicros - lastRampUpdateMicros;
+
+  if (elapsedMicros < 1000UL) return;
+  lastRampUpdateMicros = nowMicros;
+
+  if (!mpuDetected || !rtcTimeIsValid || isTargetReached) {
+    instantaneousCommandRatePps = 0.0f;
+    return;
+  }
+
+  // Traducción matemática del error angular a un "equivalente en pulsos" 
+  // para seguir aprovechando la rampa de aceleración previa
+  const float degreeError = abs(targetPanelAngle - currentPanelAngle);
+  const int32_t remainingVirtualPulses = static_cast<int32_t>(degreeError / PANEL_DEGREES_PER_PULSE);
+
+  const float brakingLimitedRate = sqrtf(2.0f * ACCELERATION_PPS2 * remainingVirtualPulses);
+
+  float desiredRate = min(static_cast<float>(FIXED_STEP_RATE_PPS), brakingLimitedRate);
+  const float minimumMovingRate = min(static_cast<float>(FIXED_STEP_RATE_PPS), START_STEP_RATE_PPS);
+
+  if (desiredRate < minimumMovingRate) {
+    desiredRate = minimumMovingRate;
+  }
+
+  if (instantaneousCommandRatePps <= 0.0f) {
+    instantaneousCommandRatePps = minimumMovingRate;
+    return;
+  }
+
+  const float maximumRateChange = ACCELERATION_PPS2 * (static_cast<float>(elapsedMicros) / 1000000.0f);
+
+  if (instantaneousCommandRatePps < desiredRate) {
+    instantaneousCommandRatePps = min(desiredRate, instantaneousCommandRatePps + maximumRateChange);
+  } else if (instantaneousCommandRatePps > desiredRate) {
+    instantaneousCommandRatePps = max(desiredRate, instantaneousCommandRatePps - maximumRateChange);
+  }
+}
+
+bool hasSafetyFault() {
+  return !mpuDetected || !rtcDetected || !rtcTimeIsValid;
+}
+
+void engageMotorSafetyLock() {
+  // IMPORTANTE: en un TB6600 habilitado y sin pulsos STEP, el NEMA 23
+  // conserva torque de retención. Esto evita que el panel quede libre.
+  instantaneousCommandRatePps = 0.0f;
+  activeMotorDirection = 0;
+  isTargetReached = true;
+  systemState = SystemState::SAFETY_LOCK;
+  digitalWrite(STEP_PIN_1, STEP_IDLE_LEVEL);
+  enableMotor1();
+}
+
+void serviceMotor() {
+  if (hasSafetyFault()) {
+    engageMotorSafetyLock();
+    return;
+  }
+
+  if (isTargetReached) {
+    systemState = SystemState::RESTING;
+    resetMotionRamp();
+    // Motor activado con torque para resistir fuerza del viento al estar en descanso
+    enableMotor1();
+    return;
+  }
+
+  updateMotionRamp();
+
+  // Determinar dirección en lazo cerrado respecto al sensor IMU real
+  const int8_t direction = (targetPanelAngle > currentPanelAngle) ? 1 : -1;
+  uint32_t nowMicros = micros();
+
+  enableMotor1();
+
+  if (direction != activeMotorDirection) {
+    setMotorDirection(direction);
+    activeMotorDirection = direction;
+    instantaneousCommandRatePps = min(static_cast<float>(FIXED_STEP_RATE_PPS), START_STEP_RATE_PPS);
+    nextPulseMicros = nowMicros + DIR_SETUP_TIME_US + currentStepIntervalUs();
+    return;
+  }
+
+  if (static_cast<int32_t>(nowMicros - nextPulseMicros) < 0) return;
+
+  generateOnePulse();
+  registerGeneratedPulse();
+  systemState = SystemState::MOVING;
+
+  const uint32_t intervalUs = currentStepIntervalUs();
+  nextPulseMicros += intervalUs;
+
+  nowMicros = micros();
+  if (static_cast<int32_t>(nowMicros - nextPulseMicros) > static_cast<int32_t>(intervalUs * 2UL)) {
+    nextPulseMicros = nowMicros + intervalUs;
+  }
+}
+
+// ============================================================
+// 9. WIFI, NTP Y AP LOCAL
+// ============================================================
+
+void disableStationAndKeepAccessPoint() {
+  if (!stationInterfaceEnabled) return;
+
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);
+  delay(20);
+
+  WiFi.mode(WIFI_AP);
+  stationInterfaceEnabled = false;
+  startupInternetFinished = true;
+}
+
+void startWiFi() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(false);
+
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wifiStartupMillis = millis();
+  lastWifiRetryMillis = millis();
+}
+
+void synchronizeRtcFromNtp(const struct tm& timeInfo) {
+  const DateTime networkTime(
+      timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+      timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+
+  rtc.adjust(networkTime);
+  rtcTimeIsValid = true;
+  rtcWasSynchronizedByNtp = true;
+}
+
+void maintainStartupInternetAndRtc() {
+  if (startupInternetFinished) return;
+
+  if (!rtcDetected) {
+    // No abandonamos inmediatamente el intento de Internet: el RTC puede
+    // reconectarse durante los primeros segundos de arranque.
+    if (millis() - wifiStartupMillis >= INTERNET_STARTUP_TIMEOUT_MS) {
+      disableStationAndKeepAccessPoint();
+    }
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!ntpWasStarted) {
+      configTime(GMT_OFFSET_SECONDS, DAYLIGHT_OFFSET_SECONDS, NTP_SERVER_1, NTP_SERVER_2);
+      ntpWasStarted = true;
+    }
+
+    struct tm timeInfo;
+    if (getLocalTime(&timeInfo, 10)) {
+      synchronizeRtcFromNtp(timeInfo);
+      disableStationAndKeepAccessPoint();
+      updateTargetFromRtc();
+      return;
+    }
+  } else if (millis() - lastWifiRetryMillis >= WIFI_RETRY_INTERVAL_MS) {
+    lastWifiRetryMillis = millis();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
+  if (millis() - wifiStartupMillis >= INTERNET_STARTUP_TIMEOUT_MS) {
+    DateTime currentTime;
+    rtcTimeIsValid = readRtcClock(currentTime);
+    disableStationAndKeepAccessPoint();
+    updateTargetFromRtc();
+  }
+}
+
+// ============================================================
+// 10. RESPUESTAS DEL SERVIDOR WEB
+// ============================================================
+
+const char* stateCode() {
+  switch (systemState) {
+    case SystemState::WAITING_FOR_MPU: return "WAITING_FOR_MPU";
+    case SystemState::WAITING_FOR_RTC: return "WAITING_FOR_RTC";
+    case SystemState::SAFETY_LOCK: return "SAFETY_LOCK";
+    case SystemState::MOVING: return "MOVING";
+    case SystemState::RESTING: return "RESTING";
+  }
+  return "UNKNOWN";
+}
+
+const char* stateText() {
+  switch (systemState) {
+    case SystemState::WAITING_FOR_MPU: return "Esperando Giroscopio MPU6050";
+    case SystemState::WAITING_FOR_RTC: return "Esperando hora válida del RTC";
+    case SystemState::SAFETY_LOCK: return "BLOQUEO DE SEGURIDAD - Sensor/RTC no disponible";
+    case SystemState::MOVING: return "Movimiento";
+    case SystemState::RESTING: return "Descanso";
+  }
+  return "Desconocido";
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+
+void handleStatus() {
+  const float anglePerInterval = PANEL_TOTAL_RANGE *
+      (static_cast<float>(discretizationMinutes) / TRACKING_DURATION_MINUTES);
+
+  String json;
+  json.reserve(1024);
+
+  json += "{";
+  json += "\"stateCode\":\""; json += stateCode(); json += "\",";
+  json += "\"stateText\":\""; json += stateText(); json += "\",";
+  json += "\"mpuDetected\":"; json += mpuDetected ? "true" : "false"; json += ",";
+  json += "\"rtcDetected\":"; json += rtcDetected ? "true" : "false"; json += ",";
+  json += "\"timeValid\":"; json += rtcTimeIsValid ? "true" : "false"; json += ",";
+  json += "\"time\":\""; json += formattedRtcTime(); json += "\",";
+  json += "\"movementPaused\":"; json += movementPaused ? "true" : "false"; json += ",";
+  json += "\"safetyLock\":"; json += hasSafetyFault() ? "true" : "false"; json += ",";
+  
+  json += "\"motor1Active\":"; json += isMotor1Enabled() ? "true" : "false"; json += ",";
+  json += "\"motorDirection\":"; json += String(activeMotorDirection); json += ",";
+  json += "\"motorSpeedPPS\":"; json += String(measuredStepRatePps, 4); json += ",";
+  
+  // Vueltas acumuladas totales realizadas por este motor en todo su trabajo hoy
+  json += "\"motor1Turns\":"; json += String(static_cast<float>(totalGeneratedPulses) / DRIVER_PULSES_PER_MOTOR_REVOLUTION, 2); json += ",";
+  
+  json += "\"motorSpeedDeg\":"; json += String(measuredStepRatePps * MOTOR_DEGREES_PER_PULSE, 2); json += ",";
+
+  json += "\"isPost6pmTest\":"; json += isPost6pmTestActive ? "true" : "false"; json += ",";
+  json += "\"testMessage\":\"Prueba Post-6PM Activa: Moviéndose hacia +30° y luego retornará a -30° para comprobar funcionamiento\",";
+
+  json += "\"currentAngle\":"; json += String(currentPanelAngle, 4); json += ",";
+  json += "\"targetAngle\":"; json += String(targetPanelAngle, 4); json += ",";
+
+  const float measuredPanelDegreesPerSecond = measuredStepRatePps * PANEL_DEGREES_PER_PULSE;
+  json += "\"measuredPanelDegreesPerSecond\":"; json += String(measuredPanelDegreesPerSecond, 4); json += ",";
+  json += "\"intervalMinutes\":"; json += String(discretizationMinutes); json += ",";
+  json += "\"anglePerInterval\":"; json += String(anglePerInterval, 4); json += ",";
+  json += "\"apIP\":\""; json += WiFi.softAPIP().toString(); json += "\"";
+  json += "}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleStopMovement() {
+  movementPaused = true;
+  if (mpuDetected) {
+    targetPanelAngle = currentPanelAngle;
+  }
+  isTargetReached = true;
+  systemState = SystemState::RESTING;
+  resetMotionRamp();
+
+  if (hasSafetyFault()) {
+    engageMotorSafetyLock();
+    server.send(200, "application/json", "{\"ok\":true,\"message\":\"Movimiento detenido. Bloqueo de seguridad con torque activo.\"}");
+  } else {
+    server.send(200, "application/json", "{\"ok\":true,\"message\":\"Movimiento detenido exitosamente.\"}");
+  }
+}
+
+void handleContinueMovement() {
+  if (!mpuDetected || !rtcDetected || !rtcTimeIsValid) {
+    server.send(400, "application/json", "{\"ok\":false,\"message\":\"No se puede reanudar: bloqueo de seguridad activo por MPU/RTC.\"}");
+    return;
+  }
+
+  movementPaused = false;
+  updateTargetFromRtc();
+
+  server.send(200, "application/json", "{\"ok\":true,\"message\":\"Movimiento reanudado correctamente.\"}");
+}
+
+void handleSetInterval() {
+  if (!server.hasArg("minutes")) {
+    server.send(400, "application/json", "{\"ok\":false,\"message\":\"Falta el valor en minutos.\"}");
+    return;
+  }
+
+  const long newValue = server.arg("minutes").toInt();
+  if (newValue < 1 || newValue > TRACKING_DURATION_MINUTES) {
+    server.send(400, "application/json", "{\"ok\":false,\"message\":\"Ingrese un entero entre 1 y 720 minutos.\"}");
+    return;
+  }
+
+  discretizationMinutes = static_cast<uint16_t>(newValue);
+  preferences.putUShort("interval", discretizationMinutes);
+  
+  updateTargetFromRtc();
+
+  server.send(200, "application/json", "{\"ok\":true,\"minutes\":" + String(discretizationMinutes) + "}");
+}
+
+void handleNotFound() {
+  server.send(404, "application/json", "{\"ok\":false,\"message\":\"Ruta no encontrada.\"}");
+}
+
+void startWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/stopMovement", HTTP_POST, handleStopMovement);
+  server.on("/continueMovement", HTTP_POST, handleContinueMovement);
+  server.on("/setInterval", HTTP_POST, handleSetInterval);
+  server.onNotFound(handleNotFound);
+  server.begin();
+}
+
+// ============================================================
+// 11. INICIALIZACION I2C (RTC Y MPU)
+// ============================================================
+
+void detectRtc() {
+  const bool addressPresent = i2cAddressResponds(Wire, DS3231_ADDR);
+
+  if (!addressPresent) {
+    if (rtcDetected) {
+      Serial.println("RTC DS3231 perdido: 0x68 dejo de responder.");
+    }
+    rtcDetected = false;
+    rtcTimeIsValid = false;
+    return;
+  }
+
+  if (!rtcDetected) {
+    rtcDetected = rtc.begin(&Wire);
+    if (rtcDetected) {
+      Serial.println("RTC DS3231 detectado correctamente en 0x68.");
+    } else {
+      Serial.println("Hay respuesta en 0x68, pero RTClib no pudo iniciar el DS3231.");
+      rtcTimeIsValid = false;
+      return;
+    }
+  }
+
+  DateTime currentTime;
+  rtcTimeIsValid = readRtcClock(currentTime);
+  if (rtcTimeIsValid) {
+    checkAndResetDailyPulses(currentTime);
+  }
+}
+
+void serviceI2CDevices() {
+  if (millis() - lastI2CRetryMillis < I2C_RETRY_INTERVAL_MS) return;
+  lastI2CRetryMillis = millis();
+
+  // Verificar RTC aun cuando antes estuviera conectado, para detectar desconexiones.
+  if (!i2cAddressResponds(Wire, DS3231_ADDR)) {
+    if (rtcDetected) Serial.println("RTC DS3231 desconectado. BLOQUEO DE SEGURIDAD.");
+    rtcDetected = false;
+    rtcTimeIsValid = false;
+  } else if (!rtcDetected) {
+    detectRtc();
+  }
+
+  // Si el MPU se perdió, intentar recuperarlo automáticamente.
+  if (!mpuDetected) {
+    initializeMPU();
+    if (mpuDetected) {
+      // Unas lecturas iniciales para estabilizar el filtro.
+      for (int i = 0; i < 10; ++i) {
+        readMPUAngle();
+        delay(5);
+      }
+    }
+  }
+}
+
+void initializeI2CDevices() {
+  // RTC DS3231 en el controlador I2C 0
+  Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);
+  Wire.setClock(100000); // 100 kHz: más tolerante para cableado de prototipo
+
+  // MPU6050 en el controlador I2C 1, completamente separado del RTC
+  mpuWire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 100000);
+
+  delay(100);
+
+  scanI2CBus(Wire, "I2C RTC (SDA 21 / SCL 22)");
+  scanI2CBus(mpuWire, "I2C MPU6050 (SDA 32 / SCL 33)");
+
+  // RTC DS3231 en 0x68, bus Wire
+  detectRtc();
+
+  // MPU6050 en 0x68, bus mpuWire
+  initializeMPU();
+
+  if (mpuDetected) {
+    for (int i = 0; i < 20; ++i) {
+      readMPUAngle();
+      delay(10);
+    }
+  }
+}
+
+// ============================================================
+// 12. SETUP Y LOOP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // Pines Motor 1
+  pinMode(STEP_PIN_1, OUTPUT);
+  pinMode(DIR_PIN_1, OUTPUT);
+  pinMode(ENA_PIN_1, OUTPUT);
+  digitalWrite(STEP_PIN_1, STEP_IDLE_LEVEL);
+  disableMotor1();
+  
+  preferences.begin("tracker", false);
+  discretizationMinutes = preferences.getUShort("interval", 60);
+  if (discretizationMinutes < 1 || discretizationMinutes > TRACKING_DURATION_MINUTES) {
+    discretizationMinutes = 60;
+  }
+
+  initializeI2CDevices();
+  startWiFi();
+  startWebServer();
+
+  lastScheduleUpdateMillis = millis();
+  lastMpuReadMillis = millis();
+  lastI2CRetryMillis = millis();
+  nextPulseMicros = micros();
+  speedWindowStartMicros = micros();
+}
+
+void loop() {
+  server.handleClient();
+  serviceI2CDevices();
+  maintainStartupInternetAndRtc();
+
+  // Lectura continua del MPU (cada 20ms aprox)
+  if (millis() - lastMpuReadMillis >= 20UL) {
+    lastMpuReadMillis = millis();
+    readMPUAngle();
+  }
+
+  // Refrescar cronograma objetivo 1 vez por segundo
+  if (millis() - lastScheduleUpdateMillis >= 1000UL) {
+    lastScheduleUpdateMillis = millis();
+    updateTargetFromRtc();
+  }
+
+  serviceMotor();
+  updateMeasuredPulseSpeed();
+  delay(0);
+}
